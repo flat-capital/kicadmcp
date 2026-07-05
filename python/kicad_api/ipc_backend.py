@@ -20,7 +20,7 @@ import platform
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from kicad_api.base import APINotAvailableError, BoardAPI, ConnectionError, KiCADBackend
 
@@ -173,6 +173,93 @@ class IPCBackend(KiCADBackend):
         except Exception:
             return "unknown"
 
+    def _get_open_documents(self, doc_type_name: Optional[str] = None) -> List[Any]:
+        """Return open KiCad documents across kipy API versions.
+
+        KiCad 10.0.4's bundled kipy requires get_open_documents(doc_type);
+        older versions accepted get_open_documents() with no argument.
+        """
+        if not self._kicad:
+            return []
+
+        if doc_type_name:
+            try:
+                from kipy.proto.common.types import DocumentType
+
+                doc_type = getattr(DocumentType, doc_type_name)
+                return list(self._kicad.get_open_documents(doc_type))
+            except TypeError as e:
+                logger.debug(
+                    "Typed get_open_documents(%s) unsupported by this kipy: %s",
+                    doc_type_name,
+                    e,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Could not read open %s documents via IPC: %s",
+                    doc_type_name,
+                    e,
+                )
+                return []
+
+        try:
+            return list(self._kicad.get_open_documents())
+        except TypeError as e:
+            logger.debug("Untyped get_open_documents() unsupported by this kipy: %s", e)
+        except Exception as e:
+            logger.debug(f"Could not read open documents via IPC: {e}")
+        return []
+
+    @staticmethod
+    def _document_board_path(doc: Any) -> Optional[str]:
+        """Extract an absolute .kicad_pcb path from a KiCad document specifier."""
+        for attr in ("path", "filename", "file_path"):
+            value = getattr(doc, attr, None)
+            if value and str(value).endswith(".kicad_pcb"):
+                return str(value)
+
+        board_filename = getattr(doc, "board_filename", None)
+        project = getattr(doc, "project", None)
+        project_path = getattr(project, "path", None) if project is not None else None
+
+        if board_filename and project_path:
+            project_dir = Path(str(project_path))
+            if project_dir.suffix == ".kicad_pro":
+                project_dir = project_dir.parent
+            return str(project_dir / str(board_filename))
+
+        return None
+
+    @staticmethod
+    def _document_project_path(doc: Any) -> Optional[str]:
+        """Extract a .kicad_pro path from a KiCad document specifier when possible."""
+        project = getattr(doc, "project", None)
+        project_path = getattr(project, "path", None) if project is not None else None
+        if not project_path:
+            return None
+
+        path = Path(str(project_path))
+        if path.suffix == ".kicad_pro":
+            return str(path)
+
+        project_name = getattr(project, "name", None)
+        if project_name:
+            return str(path / f"{project_name}.kicad_pro")
+
+        return str(path)
+
+    @staticmethod
+    def _same_path(left: Union[Path, str], right: Union[Path, str]) -> bool:
+        """Compare paths without requiring them to exist."""
+        try:
+            return Path(left).expanduser().resolve(strict=False) == Path(right).expanduser().resolve(
+                strict=False
+            )
+        except Exception:
+            return os.path.abspath(os.path.expanduser(str(left))) == os.path.abspath(
+                os.path.expanduser(str(right))
+            )
+
     def disconnect(self) -> None:
         """Disconnect from KiCAD.
 
@@ -219,9 +306,10 @@ class IPCBackend(KiCADBackend):
         if not self.is_connected():
             return None
         try:
-            for doc in self._kicad.get_open_documents():
-                if hasattr(doc, "path") and str(doc.path).endswith(".kicad_pcb"):
-                    return str(doc.path)
+            for doc in self._get_open_documents("DOCTYPE_PCB"):
+                board_path = self._document_board_path(doc)
+                if board_path:
+                    return board_path
         except Exception as e:
             logger.debug(f"Could not read open documents via IPC: {e}")
         return None
@@ -266,12 +354,31 @@ class IPCBackend(KiCADBackend):
 
         try:
             # Check for open documents
-            documents = self._kicad.get_open_documents()
+            documents = self._get_open_documents("DOCTYPE_PCB")
 
             # Look for matching project
-            path_str = str(path)
+            target_project_path = Path(path)
+            target_board_path: Optional[Path] = None
+            if target_project_path.suffix == ".kicad_pro":
+                target_board_path = target_project_path.with_suffix(".kicad_pcb")
+            elif target_project_path.suffix == ".kicad_pcb":
+                target_board_path = target_project_path
+                target_project_path = target_project_path.with_suffix(".kicad_pro")
+
             for doc in documents:
-                if path_str in str(doc):
+                document_project_path = self._document_project_path(doc)
+                document_board_path = self._document_board_path(doc)
+                if document_project_path and self._same_path(
+                    target_project_path, document_project_path
+                ):
+                    return {
+                        "success": True,
+                        "message": f"Project already open: {path}",
+                        "path": str(path),
+                    }
+                if target_board_path and document_board_path and self._same_path(
+                    target_board_path, document_board_path
+                ):
                     return {
                         "success": True,
                         "message": f"Project already open: {path}",
@@ -727,10 +834,11 @@ class IPCBoardAPI(BoardAPI):
 
             # Try to get the board path from kipy
             try:
-                docs = self._kicad.get_open_documents()
+                docs = self._get_open_documents("DOCTYPE_PCB")
                 for doc in docs:
-                    if hasattr(doc, "path") and str(doc.path).endswith(".kicad_pcb"):
-                        board_path = str(doc.path)
+                    document_board_path = IPCBackend._document_board_path(doc)
+                    if document_board_path:
+                        board_path = document_board_path
                         break
             except Exception as e:
                 logger.debug(f"Could not get board path from IPC: {e}")
